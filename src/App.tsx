@@ -7,8 +7,9 @@ import ConsoleGrid from './components/ConsoleGrid';
 import RomTable from './components/RomTable';
 import JobStatus from './components/JobStatus';
 import ScraperControls from './components/ScraperControls';
+import QueuePage from './components/QueuePage';
 
-type View = 'consoles' | 'roms';
+type View = 'consoles' | 'roms' | 'queue';
 
 export default function App() {
   const [view, setView] = useState<View>('consoles');
@@ -137,7 +138,7 @@ export default function App() {
 
           {/* Nav tabs */}
           <nav style={{ display: 'flex', gap: 2 }}>
-            {(['consoles', 'roms'] as View[]).map(v => (
+            {(['consoles', 'roms', 'queue'] as View[]).map(v => (
               <button
                 key={v}
                 onClick={() => { setView(v); if (v === 'consoles') setSelectedConsole(null); }}
@@ -156,6 +157,8 @@ export default function App() {
               >
                 {v === 'consoles'
                   ? `Consoles${consoles.length ? ` (${consoles.length})` : ''}`
+                  : v === 'queue'
+                  ? 'Queue'
                   : 'ROMs'}
               </button>
             ))}
@@ -208,10 +211,12 @@ export default function App() {
             </div>
           )}
 
-          <ScraperControls
-            latestJob={latestJob}
-            onJobStart={() => { fetchLatestJob(); fetchConsoles(); fetchTotalRoms(); }}
-          />
+          {view !== 'queue' && (
+            <ScraperControls
+              latestJob={latestJob}
+              onJobStart={() => { fetchLatestJob(); fetchConsoles(); fetchTotalRoms(); }}
+            />
+          )}
         </div>
       </header>
 
@@ -240,8 +245,8 @@ export default function App() {
         </div>
       )}
 
-      {/* Empty state */}
-      {!loading && !isScraped && (
+      {/* Empty state (only for consoles/roms view) */}
+      {!loading && !isScraped && view !== 'queue' && (
         <div style={{
           flex: 1, display: 'flex', flexDirection: 'column',
           alignItems: 'center', justifyContent: 'center',
@@ -300,9 +305,12 @@ export default function App() {
       )}
 
       {/* Main content */}
-      {!loading && isScraped && (
+      {!loading && (
         <main style={{ flex: 1, padding: '24px', maxWidth: 1440, width: '100%', margin: '0 auto', boxSizing: 'border-box' }}>
-          {view === 'consoles' && (
+          {view === 'queue' && (
+            <QueuePage consoles={consoles} />
+          )}
+          {view === 'consoles' && isScraped && (
             <ConsoleGrid
               consoles={consoles}
               latestJob={latestJob}
@@ -311,7 +319,7 @@ export default function App() {
               onScrapeConsoles={handleScrapeConsoles}
             />
           )}
-          {view === 'roms' && (
+          {view === 'roms' && isScraped && (
             <RomTable
               roms={roms}
               loading={romsLoading}

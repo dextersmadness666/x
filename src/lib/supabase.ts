@@ -30,8 +30,9 @@ export type Rom = {
 
 export type ScrapeJob = {
   id: string;
-  status: 'pending' | 'running' | 'completed' | 'failed';
-  started_at: string;
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+  target_label: string | null;
+  started_at: string | null;
   completed_at: string | null;
   error_msg: string | null;
   consoles_scraped: number;
@@ -104,4 +105,34 @@ export async function getAllMatchingRoms(params: {
   if (params.search?.trim()) q.set('search',  params.search.trim());
   const { data } = await apiFetch<{ data: Array<{ id: string; title: string; download_url: string | null }> }>(`/roms?${q}`);
   return data;
+}
+
+export type ScrapeParams = {
+  console?: string;
+  consoles?: string[];
+  consolesOnly?: boolean;
+  limit?: number;
+};
+
+export async function getJobs(): Promise<ScrapeJob[]> {
+  return apiFetch('/jobs');
+}
+
+export async function createQueuedJob(opts: { label: string; params: ScrapeParams }): Promise<ScrapeJob> {
+  return apiFetch('/jobs', {
+    method: 'POST',
+    body: JSON.stringify(opts),
+  });
+}
+
+export async function startJob(jobId: string): Promise<void> {
+  await apiFetch(`/jobs/${jobId}/start`, { method: 'POST', body: '{}' });
+}
+
+export async function cancelJob(jobId: string): Promise<void> {
+  await apiFetch(`/jobs/${jobId}/cancel`, { method: 'POST', body: '{}' });
+}
+
+export async function deleteJob(jobId: string): Promise<void> {
+  await apiFetch(`/jobs/${jobId}`, { method: 'DELETE' });
 }

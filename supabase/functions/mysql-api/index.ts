@@ -19,6 +19,7 @@ let dbReady = false;
 
 async function ensureDb() {
   if (dbReady) return;
+
   const boot = await mysql.createConnection({
     host: MYSQL_HOST, port: MYSQL_PORT,
     user: MYSQL_USER, password: MYSQL_PASSWORD,
@@ -60,11 +61,18 @@ async function ensureDb() {
     host: MYSQL_HOST, port: MYSQL_PORT,
     user: MYSQL_USER, password: MYSQL_PASSWORD,
     database: MYSQL_DATABASE,
-    waitForConnections: true,
-    connectionLimit: 10,
-    enableKeepAlive: true,
-    keepAliveInitialDelay: 0,
+    waitForConnections: true, connectionLimit: 10,
+    enableKeepAlive: true, keepAliveInitialDelay: 0,
   });
+
+  // Migrate: add queue support columns (idempotent)
+  for (const sql of [
+    "ALTER TABLE scrape_jobs ADD COLUMN target_label VARCHAR(255)",
+    "ALTER TABLE scrape_jobs ADD COLUMN job_params TEXT",
+  ]) {
+    try { await pool.execute(sql); } catch { /* column already exists */ }
+  }
+
   dbReady = true;
 }
 
@@ -75,7 +83,7 @@ function json(data: unknown, status = 200) {
   });
 }
 
-// ── Route handlers ────────────────────────────────────────────────────────────
+// ── Read-only API handlers ─────────────────────────────────────────────────────
 
 async function handleConsoles() {
   const [rows] = await pool!.execute(`
@@ -112,8 +120,7 @@ async function handleRoms(search: URLSearchParams) {
 
   if (all) {
     const [rows] = await pool!.execute(
-      `SELECT id, title, download_url FROM roms WHERE ${where} ORDER BY download_count DESC`,
-      params
+      `SELECT id, title, download_url FROM roms WHERE ${where} ORDER BY download_count DESC`, params
     );
     return json({ data: rows });
   }
@@ -136,7 +143,62 @@ async function handleLatestJob() {
   return json(rows[0] ?? null);
 }
 
-// ── Scraping helpers ──────────────────────────────────────────────────────────
+// ── Queue management handlers ─────────────────────────────────────────────────
+
+async function handleGetJobs() {
+  const [rows] = await pool!.execute(
+    "SELECT * FROM scrape_jobs ORDER BY created_at DESC LIMIT 100"
+  ) as [Record<string,unknown>[], unknown];
+  return json(rows);
+}
+
+type ScrapeParams = {
+  console?: string;
+  consoles?: string[];
+  consolesOnly?: boolean;
+  limit?: number;
+};
+
+async function handleCreateJob(body: { label?: string; params?: ScrapeParams }) {
+  const id     = crypto.randomUUID();
+  const label  = body.label ?? "Scrape job";
+  const params = JSON.stringify(body.params ?? {});
+  await pool!.query(
+    "INSERT INTO scrape_jobs (id, status, target_label, job_params, created_at, started_at) VALUES (?, 'queued', ?, ?, NOW(), NULL)",
+    [id, label, params]
+  );
+  const [rows] = await pool!.execute(
+    "SELECT * FROM scrape_jobs WHERE id = ?", [id]
+  ) as [Record<string,unknown>[], unknown];
+  return json(rows[0], 201);
+}
+
+async function handleStartJob(jobId: string) {
+  const [rows] = await pool!.execute(
+    "SELECT status, job_params FROM scrape_jobs WHERE id = ?", [jobId]
+  ) as [Record<string,unknown>[], unknown];
+  if (!rows.length)               return json({ error: "Job not found" }, 404);
+  if (rows[0].status !== "queued") return json({ error: "Job is not in queued state" }, 400);
+
+  const params: ScrapeParams = JSON.parse((rows[0].job_params as string) ?? "{}");
+  runScrapeJob(jobId, params);
+  return json({ ok: true });
+}
+
+async function handleCancelJob(jobId: string) {
+  await pool!.execute(
+    "UPDATE scrape_jobs SET status = 'cancelled' WHERE id = ? AND status IN ('running', 'queued')",
+    [jobId]
+  );
+  return json({ ok: true });
+}
+
+async function handleDeleteJob(jobId: string) {
+  await pool!.execute("DELETE FROM scrape_jobs WHERE id = ?", [jobId]);
+  return json({ ok: true });
+}
+
+// ── Scraping engine ───────────────────────────────────────────────────────────
 
 const BASE_URL = "https://www.romspedia.com";
 const FETCH_HEADERS = {
@@ -161,8 +223,17 @@ async function fetchWithRetry(url: string, attempts = 3): Promise<string> {
   throw lastErr;
 }
 
+async function isJobCancelled(jobId: string): Promise<boolean> {
+  try {
+    const [rows] = await pool!.execute(
+      "SELECT status FROM scrape_jobs WHERE id = ?", [jobId]
+    ) as [Record<string,unknown>[], unknown];
+    return (rows[0] as {status: string})?.status === "cancelled";
+  } catch { return false; }
+}
+
 type ConsoleRow = { name: string; slug: string; image_url: string | null; rom_count: number; total_downloads: number };
-type RomRow    = { console_slug: string; title: string; slug: string; image_url: string | null; download_count: number; page_url: string; download_url: string | null; console_id?: string };
+type RomRow     = { console_slug: string; title: string; slug: string; image_url: string | null; download_count: number; page_url: string; download_url: string | null; console_id?: string };
 
 function parseConsoles(html: string): ConsoleRow[] {
   const doc = new DOMParser().parseFromString(html, "text/html");
@@ -224,8 +295,7 @@ async function fetchDirectUrl(pageUrl: string): Promise<string | null> {
   } catch { return null; }
 }
 
-// 15 concurrent workers, 30 ms cooldown per worker — ~5x faster than before
-async function resolveUrls(roms: RomRow[], onProgress?: (d: number, t: number) => Promise<void>) {
+async function resolveUrls(roms: RomRow[], jobId: string, onProgress?: (d: number, t: number) => Promise<void>) {
   const queue = [...roms];
   let done = 0;
   const total = roms.length;
@@ -290,7 +360,8 @@ async function updateJob(jobId: string, fields: Record<string, unknown>) {
   await pool!.query(`UPDATE scrape_jobs SET ${sets} WHERE id=?`, [...Object.values(fields), jobId]);
 }
 
-async function scrapeConsole(c: ConsoleRow, limit: number, jobId: string): Promise<number> {
+// Returns ROM count scraped, or null if the job was cancelled mid-console
+async function scrapeConsole(c: ConsoleRow, limit: number, jobId: string): Promise<number | null> {
   const firstUrl = `${BASE_URL}/roms/${c.slug}`;
   let firstHtml: string;
   try {
@@ -306,19 +377,23 @@ async function scrapeConsole(c: ConsoleRow, limit: number, jobId: string): Promi
 
   for (let p = 2; p <= maxPage; p++) {
     if (limit && all.length >= limit) break;
+    // Check cancel every 10 pages
+    if (p % 10 === 0 && await isJobCancelled(jobId)) return null;
     await sleep(250);
     try {
       all.push(...parseRomPage(await fetchWithRetry(`${firstUrl}/page/${p}`), c.slug));
       await updateJob(jobId, { pages_done: p });
     } catch (e) {
-      // Skip failed pages — don't abort the console
-      console.warn(`Page ${p} of ${c.slug} failed:`, e);
+      console.warn(`Page ${p} of ${c.slug} failed (skipping):`, e);
     }
   }
 
   const seen = new Set<string>();
   const deduped = all.filter(r => { if (seen.has(r.slug)) return false; seen.add(r.slug); return true; });
   const final   = limit ? deduped.slice(0, limit) : deduped;
+
+  // Check cancel before slow URL resolution step
+  if (await isJobCancelled(jobId)) return null;
 
   const existing = await loadExistingUrls(c.slug);
   const newRoms  = final.filter(r => {
@@ -328,7 +403,7 @@ async function scrapeConsole(c: ConsoleRow, limit: number, jobId: string): Promi
   });
 
   if (newRoms.length) {
-    await resolveUrls(newRoms, async (done, total) => {
+    await resolveUrls(newRoms, jobId, async (done, total) => {
       await updateJob(jobId, { urls_done: done, urls_total: total });
     });
   }
@@ -338,52 +413,55 @@ async function scrapeConsole(c: ConsoleRow, limit: number, jobId: string): Promi
   return final.length;
 }
 
-async function handleScrapeStart(body: { console?: string; consoles?: string[]; consolesOnly?: boolean; limit?: number }) {
-  const jobId = crypto.randomUUID();
-  await pool!.query(
-    "INSERT INTO scrape_jobs (id,status,created_at,started_at) VALUES (?,?,NOW(),NOW())",
-    [jobId, "running"]
-  );
-
+// Schedules background scraping for a job (transitions queued → running)
+function runScrapeJob(jobId: string, params: ScrapeParams) {
   EdgeRuntime.waitUntil((async () => {
     try {
+      await pool!.execute(
+        "UPDATE scrape_jobs SET status='running', started_at=NOW() WHERE id=?", [jobId]
+      );
+
       const html        = await fetchWithRetry(`${BASE_URL}/roms`);
       const allConsoles = parseConsoles(html);
 
       let targets = allConsoles;
-      if (body.consoles?.length) {
-        targets = allConsoles.filter(c => (body.consoles as string[]).includes(c.slug));
-      } else if (body.console) {
+      if (params.consoles?.length) {
+        targets = allConsoles.filter(c => (params.consoles as string[]).includes(c.slug));
+      } else if (params.console) {
         targets = allConsoles.filter(c =>
-          c.slug === body.console ||
-          c.name.toLowerCase().includes(body.console!.toLowerCase())
+          c.slug === params.console ||
+          c.name.toLowerCase().includes(params.console!.toLowerCase())
         );
       }
 
       await updateJob(jobId, { consoles_scraped: targets.length });
 
-      if (body.consolesOnly) {
-        for (const c of targets) await upsertConsole(c);
-        await updateJob(jobId, { status: "completed", completed_at: new Date() });
+      if (params.consolesOnly) {
+        for (const c of targets) {
+          if (await isJobCancelled(jobId)) break;
+          await upsertConsole(c);
+        }
+        const cancelled = await isJobCancelled(jobId);
+        await updateJob(jobId, { status: cancelled ? "cancelled" : "completed", completed_at: new Date() });
         return;
       }
 
       let totalRoms = 0;
       const errors: string[] = [];
-
-      // Process 2 consoles concurrently
       const queue = [...targets];
+
       const workers = Array.from({ length: 2 }, async () => {
         while (queue.length) {
+          if (await isJobCancelled(jobId)) break;
           const c = queue.shift();
           if (!c) break;
           await updateJob(jobId, { current_console: c.name, pages_done: 0, pages_total: 0, urls_done: 0, urls_total: 0 });
           try {
-            const count = await scrapeConsole(c, body.limit ?? 0, jobId);
-            totalRoms += count;
+            const result = await scrapeConsole(c, params.limit ?? 0, jobId);
+            if (result === null) break; // cancelled
+            totalRoms += result;
             await updateJob(jobId, { roms_scraped: totalRoms });
           } catch (err) {
-            // Log failure but keep going with remaining consoles
             const msg = `${c.name}: ${String(err)}`;
             errors.push(msg);
             console.error("Console failed:", msg);
@@ -393,19 +471,38 @@ async function handleScrapeStart(body: { console?: string; consoles?: string[]; 
       });
       await Promise.all(workers);
 
+      const wasCancelled = await isJobCancelled(jobId);
       await updateJob(jobId, {
-        status: errors.length && totalRoms === 0 ? "failed" : "completed",
+        status: wasCancelled ? "cancelled"
+          : errors.length && totalRoms === 0 ? "failed"
+          : "completed",
         completed_at: new Date(),
         roms_scraped: totalRoms,
         current_console: null,
-        ...(errors.length ? { error_msg: errors.slice(0, 3).join("; ") } : {}),
+        ...(errors.length && !wasCancelled ? { error_msg: errors.slice(0, 3).join("; ") } : {}),
       });
     } catch (err) {
       await updateJob(jobId, { status: "failed", completed_at: new Date(), error_msg: String(err) });
     }
   })());
+}
 
-  return json({ ok: true, jobId }, 202);
+// Legacy endpoint: create + immediately start
+async function handleScrapeStart(body: ScrapeParams & { label?: string }) {
+  const id    = crypto.randomUUID();
+  const label = body.label
+    ?? (body.consolesOnly   ? "Import consoles"
+      : body.consoles?.length === 1 ? (body.consoles[0])
+      : body.consoles?.length       ? `${body.consoles.length} consoles`
+      : body.console                ? body.console
+      :                               "Full scrape");
+
+  await pool!.query(
+    "INSERT INTO scrape_jobs (id, status, target_label, job_params, created_at, started_at) VALUES (?, 'queued', ?, ?, NOW(), NOW())",
+    [id, label, JSON.stringify(body)]
+  );
+  runScrapeJob(id, body);
+  return json({ ok: true, jobId: id }, 202);
 }
 
 // ── Main handler ──────────────────────────────────────────────────────────────
@@ -413,26 +510,40 @@ async function handleScrapeStart(body: { console?: string; consoles?: string[]; 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response(null, { status: 200, headers: corsHeaders });
 
-  try {
-    await ensureDb();
-  } catch (err) {
+  try { await ensureDb(); } catch (err) {
     return json({ error: `DB init failed: ${String(err)}` }, 503);
   }
 
-  const url  = new URL(req.url);
-  const path = url.pathname.replace(/^.*\/mysql-api/, "") || "/";
+  const url    = new URL(req.url);
+  const path   = url.pathname.replace(/^.*\/mysql-api/, "") || "/";
+  const method = req.method;
 
   try {
-    if (req.method === "GET") {
+    // Read-only routes (no body parsing needed)
+    if (method === "GET") {
       if (path === "/consoles")     return handleConsoles();
       if (path === "/roms/total")   return handleRomsTotal();
       if (path.startsWith("/roms")) return handleRoms(url.searchParams);
       if (path === "/jobs/latest")  return handleLatestJob();
+      if (path === "/jobs")         return handleGetJobs();
     }
-    if (req.method === "POST" && path === "/scrape") {
-      const body = await req.json().catch(() => ({}));
-      return handleScrapeStart(body);
+
+    const body = await req.json().catch(() => ({}));
+
+    // Queue management
+    if (method === "POST"   && path === "/jobs")   return handleCreateJob(body);
+    if (method === "POST"   && path === "/scrape")  return handleScrapeStart(body);
+
+    const jobAction = path.match(/^\/jobs\/([^/]+)\/(start|cancel)$/);
+    if (method === "POST" && jobAction) {
+      const [, id, action] = jobAction;
+      if (action === "start")  return handleStartJob(id);
+      if (action === "cancel") return handleCancelJob(id);
     }
+
+    const jobId = path.match(/^\/jobs\/([^/]+)$/)?.[1];
+    if (method === "DELETE" && jobId) return handleDeleteJob(jobId);
+
     return json({ error: "Not found" }, 404);
   } catch (err) {
     return json({ error: String(err) }, 500);
