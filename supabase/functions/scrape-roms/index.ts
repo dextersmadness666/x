@@ -253,7 +253,7 @@ Deno.serve(async (req: Request) => {
     Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
   );
 
-  let body: { console?: string; consoles?: string[]; limit?: number } = {};
+  let body: { console?: string; consoles?: string[]; consolesOnly?: boolean; limit?: number } = {};
   try { body = await req.json(); } catch { /* empty body ok */ }
 
   const perConsoleLimit = body.limit ?? 0;
@@ -267,6 +267,27 @@ Deno.serve(async (req: Request) => {
 
   EdgeRuntime.waitUntil((async () => {
     try {
+      // Fast path: only import console metadata, skip ROM scraping
+      if (body.consolesOnly) {
+        const indexHtml = await fetchHTML(`${BASE_URL}/roms`);
+        const allConsoles = parseConsoles(indexHtml);
+
+        const BATCH = 20;
+        for (let i = 0; i < allConsoles.length; i += BATCH) {
+          await supabase.from("consoles").upsert(
+            allConsoles.slice(i, i + BATCH),
+            { onConflict: "slug" }
+          );
+        }
+
+        await supabase.from("scrape_jobs").update({
+          status: "completed",
+          completed_at: new Date().toISOString(),
+          consoles_scraped: allConsoles.length,
+        }).eq("id", jobId);
+        return;
+      }
+
       // 1. Parse console list
       const indexHtml = await fetchHTML(`${BASE_URL}/roms`);
       const allConsoles = parseConsoles(indexHtml);

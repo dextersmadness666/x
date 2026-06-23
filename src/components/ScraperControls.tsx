@@ -11,9 +11,24 @@ export default function ScraperControls({ latestJob, onJobStart }: Props) {
   const [consoleSlug, setConsoleSlug] = useState('');
   const [limit, setLimit] = useState('');
   const [loading, setLoading] = useState(false);
+  const [importing, setImporting] = useState(false);
   const [error, setError] = useState('');
 
   const isRunning = latestJob?.status === 'running';
+
+  async function importConsoleList() {
+    if (isRunning || importing) return;
+    setImporting(true);
+    setError('');
+    try {
+      await startScrapeJob({ consolesOnly: true });
+      onJobStart();
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Unknown error');
+    } finally {
+      setImporting(false);
+    }
+  }
 
   async function startScrape() {
     setLoading(true);
@@ -35,7 +50,16 @@ export default function ScraperControls({ latestJob, onJobStart }: Props) {
   }
 
   return (
-    <div style={{ position: 'relative' }}>
+    <div style={{ position: 'relative', display: 'flex', gap: 6, alignItems: 'center' }}>
+
+      {/* Import console list */}
+      <ImportBtn
+        disabled={isRunning}
+        loading={importing}
+        onClick={importConsoleList}
+      />
+
+      {/* Run scraper */}
       <button
         data-scraper-btn
         onClick={() => setOpen(o => !o)}
@@ -174,6 +198,53 @@ export default function ScraperControls({ latestJob, onJobStart }: Props) {
         </>
       )}
     </div>
+  );
+}
+
+function ImportBtn({ disabled, loading, onClick }: { disabled: boolean; loading: boolean; onClick: () => void }) {
+  const [hov, setHov] = useState(false);
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled || loading}
+      title="Import console list from Romspedia (fast — no ROMs)"
+      onMouseEnter={() => setHov(true)}
+      onMouseLeave={() => setHov(false)}
+      style={{
+        background: hov && !disabled && !loading ? 'var(--surface-3)' : 'var(--surface-2)',
+        border: '1px solid var(--border)',
+        borderRadius: 'var(--radius-sm)',
+        color: disabled || loading ? 'var(--text-3)' : 'var(--text-2)',
+        padding: '7px 12px',
+        fontSize: 13,
+        fontWeight: 500,
+        cursor: disabled || loading ? 'default' : 'pointer',
+        display: 'flex', alignItems: 'center', gap: 6,
+        transition: 'background 0.12s, color 0.12s',
+        opacity: disabled ? 0.5 : 1,
+      }}
+    >
+      {loading ? (
+        <>
+          <div style={{
+            width: 11, height: 11,
+            border: '2px solid var(--border)',
+            borderTopColor: 'var(--text-2)',
+            borderRadius: '50%',
+            animation: 'spin 0.8s linear infinite',
+          }}/>
+          Importing…
+        </>
+      ) : (
+        <>
+          <svg width="12" height="12" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M10 3v10M5 13l5 5 5-5"/>
+            <path d="M3 17h14"/>
+          </svg>
+          Import List
+        </>
+      )}
+    </button>
   );
 }
 

@@ -255,7 +255,7 @@ export default function App() {
         <div style={{
           flex: 1, display: 'flex', flexDirection: 'column',
           alignItems: 'center', justifyContent: 'center',
-          gap: 20, padding: 40,
+          gap: 24, padding: 40,
           animation: 'fade-in 0.3s ease',
         }}>
           <div style={{
@@ -268,21 +268,39 @@ export default function App() {
           }}>🎮</div>
 
           <div style={{ textAlign: 'center' }}>
-            <div style={{ fontSize: 22, fontWeight: 700, marginBottom: 8 }}>No data yet</div>
-            <div style={{ fontSize: 14, color: 'var(--text-2)', maxWidth: 420, lineHeight: 1.6 }}>
-              Run the scraper to populate the database with consoles and ROMs from Romspedia.
+            <div style={{ fontSize: 22, fontWeight: 700, marginBottom: 8 }}>No consoles imported yet</div>
+            <div style={{ fontSize: 14, color: 'var(--text-2)', maxWidth: 400, lineHeight: 1.6 }}>
+              Import the console list to populate the grid, then select which consoles to scrape ROMs for.
             </div>
+          </div>
+
+          {/* Primary CTA */}
+          <EmptyImportBtn
+            running={latestJob?.status === 'running'}
+            onImport={async () => {
+              await startScrapeJob({ consolesOnly: true });
+              fetchLatestJob();
+              fetchConsoles();
+            }}
+          />
+
+          {/* Divider */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, width: '100%', maxWidth: 400 }}>
+            <div style={{ flex: 1, height: 1, background: 'var(--border)' }}/>
+            <span style={{ fontSize: 12, color: 'var(--text-3)' }}>or use the CLI</span>
+            <div style={{ flex: 1, height: 1, background: 'var(--border)' }}/>
           </div>
 
           <div style={{
             background: 'var(--surface)',
             border: '1px solid var(--border)',
             borderRadius: 'var(--radius)',
-            padding: '18px 24px',
+            padding: '16px 20px',
             fontFamily: 'ui-monospace, "Cascadia Code", monospace',
             fontSize: 13,
             lineHeight: 2,
-            minWidth: 360,
+            width: '100%',
+            maxWidth: 400,
           }}>
             <div style={{ color: 'var(--text-3)' }}># Quick start — single console</div>
             <div>cd scraper &amp;&amp; npm install</div>
@@ -331,5 +349,55 @@ export default function App() {
         </main>
       )}
     </div>
+  );
+}
+
+function EmptyImportBtn({ running, onImport }: { running: boolean | undefined; onImport: () => Promise<void> }) {
+  const [loading, setLoading] = useState(false);
+  const disabled = running || loading;
+
+  async function handle() {
+    if (disabled) return;
+    setLoading(true);
+    try { await onImport(); } finally { setLoading(false); }
+  }
+
+  return (
+    <button
+      onClick={handle}
+      disabled={disabled}
+      style={{
+        background: disabled ? 'var(--surface-2)' : 'var(--accent)',
+        color: disabled ? 'var(--text-3)' : '#fff',
+        border: 'none',
+        borderRadius: 'var(--radius-sm)',
+        padding: '10px 28px',
+        fontSize: 14, fontWeight: 600,
+        cursor: disabled ? 'default' : 'pointer',
+        display: 'flex', alignItems: 'center', gap: 8,
+        transition: 'background 0.15s',
+      }}
+    >
+      {loading ? (
+        <>
+          <div style={{
+            width: 13, height: 13,
+            border: '2px solid rgba(255,255,255,0.3)',
+            borderTopColor: '#fff',
+            borderRadius: '50%',
+            animation: 'spin 0.8s linear infinite',
+          }}/>
+          Importing…
+        </>
+      ) : (
+        <>
+          <svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M10 3v10M5 13l5 5 5-5"/>
+            <path d="M3 17h14"/>
+          </svg>
+          Import Console List
+        </>
+      )}
+    </button>
   );
 }

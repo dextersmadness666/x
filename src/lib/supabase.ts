@@ -50,7 +50,7 @@ export type ScrapeJob = {
   created_at: string;
 };
 
-export async function startScrapeJob(options?: { console?: string; consoles?: string[]; limit?: number }): Promise<void> {
+export async function startScrapeJob(options?: { console?: string; consoles?: string[]; consolesOnly?: boolean; limit?: number }): Promise<void> {
   const { error } = await supabase.functions.invoke('scrape-roms', { body: options ?? {} });
   if (error) throw error;
 }
