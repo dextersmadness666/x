@@ -1,5 +1,8 @@
 import { useEffect, useState, useCallback } from 'react';
-import { supabase, startScrapeJob, type Console, type ConsoleWithStats, type Rom, type ScrapeJob } from './lib/supabase';
+import {
+  getConsoles, getRoms, getTotalRoms, getLatestJob, startScrapeJob, getAllMatchingRoms,
+  type Console, type ConsoleWithStats, type Rom, type ScrapeJob,
+} from './lib/supabase';
 import ConsoleGrid from './components/ConsoleGrid';
 import RomTable from './components/RomTable';
 import JobStatus from './components/JobStatus';
@@ -22,50 +25,37 @@ export default function App() {
   const PAGE_SIZE = 50;
 
   const fetchConsoles = useCallback(async () => {
-    const [{ data }, { data: counts }] = await Promise.all([
-      supabase.from('consoles').select('*').order('total_downloads', { ascending: false }),
-      supabase.rpc('get_console_rom_counts'),
-    ]);
-    const countMap = new Map(
-      (counts ?? []).map((r: { slug: string; scraped_count: number }) => [r.slug, Number(r.scraped_count)])
-    );
-    setConsoles(
-      (data ?? []).map(c => ({ ...c, scraped_count: countMap.get(c.slug) ?? 0 }))
-    );
-    setLoading(false);
+    try {
+      const data = await getConsoles();
+      setConsoles(data);
+    } finally {
+      setLoading(false);
+    }
   }, []);
 
   const fetchTotalRoms = useCallback(async () => {
-    const { count } = await supabase
-      .from('roms')
-      .select('*', { count: 'exact', head: true });
-    setTotalDbRoms(count ?? 0);
+    const total = await getTotalRoms();
+    setTotalDbRoms(total);
   }, []);
 
   const fetchRoms = useCallback(async (consoleSel: Console | null, q: string, p: number) => {
     setRomsLoading(true);
-    let query = supabase
-      .from('roms')
-      .select('*', { count: 'exact' })
-      .order('download_count', { ascending: false })
-      .range(p * PAGE_SIZE, p * PAGE_SIZE + PAGE_SIZE - 1);
-
-    if (consoleSel) query = query.eq('console_slug', consoleSel.slug);
-    if (q.trim()) query = query.ilike('title', `%${q.trim()}%`);
-
-    const { data, count } = await query;
-    setRoms(data ?? []);
-    setTotalRoms(count ?? 0);
-    setRomsLoading(false);
+    try {
+      const { data, total } = await getRoms({
+        console: consoleSel?.slug ?? null,
+        search: q,
+        page: p,
+        pageSize: PAGE_SIZE,
+      });
+      setRoms(data);
+      setTotalRoms(total);
+    } finally {
+      setRomsLoading(false);
+    }
   }, []);
 
   const fetchLatestJob = useCallback(async () => {
-    const { data } = await supabase
-      .from('scrape_jobs')
-      .select('*')
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
+    const data = await getLatestJob();
     setLatestJob(data);
   }, []);
 
@@ -274,7 +264,6 @@ export default function App() {
             </div>
           </div>
 
-          {/* Primary CTA */}
           <EmptyImportBtn
             running={latestJob?.status === 'running'}
             onImport={async () => {
@@ -284,7 +273,6 @@ export default function App() {
             }}
           />
 
-          {/* Divider */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 12, width: '100%', maxWidth: 400 }}>
             <div style={{ flex: 1, height: 1, background: 'var(--border)' }}/>
             <span style={{ fontSize: 12, color: 'var(--text-3)' }}>or use the CLI</span>
@@ -334,16 +322,10 @@ export default function App() {
               selectedConsole={selectedConsole}
               onClearConsole={() => { setSelectedConsole(null); setPage(0); }}
               filterKey={(selectedConsole?.id ?? '') + '|' + search}
-              onFetchAllMatching={async () => {
-                let query = supabase
-                  .from('roms')
-                  .select('id, title, download_url')
-                  .order('download_count', { ascending: false });
-                if (selectedConsole) query = query.eq('console_slug', selectedConsole.slug);
-                if (search.trim()) query = query.ilike('title', `%${search.trim()}%`);
-                const { data } = await query;
-                return (data ?? []) as Array<{ id: string; title: string; download_url: string | null }>;
-              }}
+              onFetchAllMatching={() => getAllMatchingRoms({
+                console: selectedConsole?.slug ?? null,
+                search,
+              })}
             />
           )}
         </main>

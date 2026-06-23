@@ -1,10 +1,3 @@
-import { createClient } from '@supabase/supabase-js';
-
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL as string;
-const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY as string;
-
-export const supabase = createClient(supabaseUrl, supabaseAnonKey);
-
 export type Console = {
   id: string;
   name: string;
@@ -16,9 +9,7 @@ export type Console = {
   created_at: string;
 };
 
-export type ConsoleWithStats = Console & {
-  scraped_count: number;
-};
+export type ConsoleWithStats = Console & { scraped_count: number };
 
 export type Rom = {
   id: string;
@@ -50,7 +41,62 @@ export type ScrapeJob = {
   created_at: string;
 };
 
-export async function startScrapeJob(options?: { console?: string; consoles?: string[]; consolesOnly?: boolean; limit?: number }): Promise<void> {
-  const { error } = await supabase.functions.invoke('scrape-roms', { body: options ?? {} });
-  if (error) throw error;
+async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(path, init);
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.statusText);
+    throw new Error(text);
+  }
+  return res.json() as Promise<T>;
+}
+
+export async function getConsoles(): Promise<ConsoleWithStats[]> {
+  return apiFetch('/api/consoles');
+}
+
+export async function getRoms(params: {
+  console?: string | null;
+  search?: string;
+  page?: number;
+  pageSize?: number;
+}): Promise<{ data: Rom[]; total: number }> {
+  const q = new URLSearchParams();
+  if (params.console)              q.set('console',  params.console);
+  if (params.search?.trim())       q.set('search',   params.search.trim());
+  if (params.page  !== undefined)  q.set('page',     String(params.page));
+  if (params.pageSize !== undefined) q.set('pageSize', String(params.pageSize));
+  return apiFetch(`/api/roms?${q}`);
+}
+
+export async function getTotalRoms(): Promise<number> {
+  const { total } = await apiFetch<{ total: number }>('/api/roms/total');
+  return total;
+}
+
+export async function getLatestJob(): Promise<ScrapeJob | null> {
+  return apiFetch('/api/jobs/latest');
+}
+
+export async function startScrapeJob(options?: {
+  console?: string;
+  consoles?: string[];
+  consolesOnly?: boolean;
+  limit?: number;
+}): Promise<void> {
+  await apiFetch('/api/scrape/start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(options ?? {}),
+  });
+}
+
+export async function getAllMatchingRoms(params: {
+  console?: string | null;
+  search?: string;
+}): Promise<Array<{ id: string; title: string; download_url: string | null }>> {
+  const q = new URLSearchParams({ all: '1' });
+  if (params.console)        q.set('console', params.console);
+  if (params.search?.trim()) q.set('search',  params.search.trim());
+  const { data } = await apiFetch<{ data: Array<{ id: string; title: string; download_url: string | null }> }>(`/api/roms?${q}`);
+  return data;
 }
