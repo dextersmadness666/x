@@ -25,7 +25,7 @@ async function initDb() {
   await conn.execute(`CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\``);
   await conn.end();
 
-  pool = mysql.createPool({ ...DB_BASE, database: DB_NAME, waitForConnections: true, connectionLimit: 5 });
+  pool = mysql.createPool({ ...DB_BASE, database: DB_NAME, waitForConnections: true, connectionLimit: 10, enableKeepAlive: true, keepAliveInitialDelay: 0 });
 
   await pool.execute(`
     CREATE TABLE IF NOT EXISTS consoles (
@@ -67,16 +67,23 @@ const HEADERS = {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-async function fetchHTML(url) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 20000);
-  try {
-    const res = await fetch(url, { headers: HEADERS, signal: controller.signal });
-    if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
-    return res.text();
-  } finally {
-    clearTimeout(timer);
+async function fetchWithRetry(url, attempts = 3) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 20000);
+    try {
+      const res = await fetch(url, { headers: HEADERS, signal: controller.signal });
+      if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+      return res.text();
+    } catch (err) {
+      lastErr = err;
+      if (i < attempts - 1) await sleep(800 * (i + 1));
+    } finally {
+      clearTimeout(timer);
+    }
   }
+  throw lastErr;
 }
 
 function parseConsoles(html) {
@@ -135,13 +142,13 @@ function parseRomPage(html, consoleSlug) {
 
 async function fetchDirectDownloadUrl(pageUrl) {
   try {
-    const html = await fetchHTML(pageUrl + '/download?speed=fast');
+    const html = await fetchWithRetry(pageUrl + '/download?speed=fast', 2);
     const match = html.match(/href="(https:\/\/downloads\.romspedia\.com\/roms\/[^"]+)"/);
     return match ? match[1] : null;
   } catch { return null; }
 }
 
-async function resolveDirectUrls(roms, concurrencyLimit = 6) {
+async function resolveDirectUrls(roms, concurrencyLimit = 15) {
   const limit = pLimit(concurrencyLimit);
   let done = 0;
   const total = roms.length;
@@ -177,7 +184,7 @@ async function scrapeConsoleRoms(consoleSlug, limitPerConsole = 0) {
   const firstUrl = `${BASE_URL}/roms/${consoleSlug}`;
   console.log(`  Scraping ${firstUrl} ...`);
   let firstHtml;
-  try { firstHtml = await fetchHTML(firstUrl); }
+  try { firstHtml = await fetchWithRetry(firstUrl); }
   catch (err) { console.warn(`  Failed: ${err.message}`); return []; }
 
   const maxPage = getMaxPage(firstHtml);
@@ -187,13 +194,16 @@ async function scrapeConsoleRoms(consoleSlug, limitPerConsole = 0) {
   if (!limitPerConsole || allRoms.length < limitPerConsole) {
     for (let p = 2; p <= maxPage; p++) {
       if (limitPerConsole && allRoms.length >= limitPerConsole) break;
-      await sleep(600);
+      await sleep(250);
       try {
-        const html = await fetchHTML(`${firstUrl}/page/${p}`);
+        const html = await fetchWithRetry(`${firstUrl}/page/${p}`);
         const pageRoms = parseRomPage(html, consoleSlug);
         allRoms.push(...pageRoms);
         console.log(`    Page ${p}/${maxPage}: ${pageRoms.length} ROMs (total: ${allRoms.length})`);
-      } catch (err) { console.warn(`    Page ${p} failed: ${err.message}`); break; }
+      } catch (err) {
+        // Skip failed page, don't abort the console
+        console.warn(`    Page ${p} failed (skipping): ${err.message}`);
+      }
     }
   }
 
@@ -317,25 +327,35 @@ async function run() {
     }
 
     let totalRoms = 0;
+    const errors = [];
     const concurrency = pLimit(2);
 
     await Promise.all(targets.map(console_ => concurrency(async () => {
       await updateJob(jobId, { current_console: console_.name });
-      const consoleId = await upsertConsole(console_);
-      const roms = await scrapeConsoleRoms(console_.slug, limit);
-      const romsWithId = roms.map(r => ({ ...r, console_id: consoleId }));
-      await upsertRoms(romsWithId);
-      totalRoms += romsWithId.length;
-      await updateJob(jobId, { roms_scraped: totalRoms });
-      console.log(`  Saved ${romsWithId.length} ROMs for ${console_.name}`);
-      await sleep(800);
+      try {
+        const consoleId = await upsertConsole(console_);
+        const roms = await scrapeConsoleRoms(console_.slug, limit);
+        const romsWithId = roms.map(r => ({ ...r, console_id: consoleId }));
+        await upsertRoms(romsWithId);
+        totalRoms += romsWithId.length;
+        await updateJob(jobId, { roms_scraped: totalRoms });
+        console.log(`  Saved ${romsWithId.length} ROMs for ${console_.name}`);
+      } catch (err) {
+        const msg = `${console_.name}: ${err.message}`;
+        errors.push(msg);
+        console.error(`  Console failed (skipping): ${msg}`);
+      }
+      await sleep(300);
     })));
 
     await updateJob(jobId, {
-      status: 'completed', completed_at: new Date(),
-      roms_scraped: totalRoms, current_console: null,
+      status: errors.length && totalRoms === 0 ? 'failed' : 'completed',
+      completed_at: new Date(),
+      roms_scraped: totalRoms,
+      current_console: null,
+      ...(errors.length ? { error_msg: errors.slice(0, 3).join('; ') } : {}),
     });
-    console.log(`\nDone! ${targets.length} consoles, ${totalRoms} ROMs saved.`);
+    console.log(`\nDone! ${targets.length} consoles, ${totalRoms} ROMs saved.${errors.length ? ` (${errors.length} consoles skipped)` : ''}`);
   } catch (err) {
     console.error('\nScraping failed:', err.message);
     await updateJob(jobId, { status: 'failed', completed_at: new Date(), error_msg: err.message });

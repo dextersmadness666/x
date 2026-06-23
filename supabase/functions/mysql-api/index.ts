@@ -14,14 +14,11 @@ const MYSQL_USER     = Deno.env.get("MYSQL_USER")     ?? "root";
 const MYSQL_PASSWORD = Deno.env.get("MYSQL_PASSWORD") ?? "Regrexboi19@";
 const MYSQL_DATABASE = Deno.env.get("MYSQL_DATABASE") ?? "romspedia";
 
-// Module-level pool, created lazily after DB init
 let pool: ReturnType<typeof mysql.createPool> | null = null;
 let dbReady = false;
 
 async function ensureDb() {
   if (dbReady) return;
-
-  // Bootstrap: create database + tables
   const boot = await mysql.createConnection({
     host: MYSQL_HOST, port: MYSQL_PORT,
     user: MYSQL_USER, password: MYSQL_PASSWORD,
@@ -63,7 +60,10 @@ async function ensureDb() {
     host: MYSQL_HOST, port: MYSQL_PORT,
     user: MYSQL_USER, password: MYSQL_PASSWORD,
     database: MYSQL_DATABASE,
-    waitForConnections: true, connectionLimit: 5,
+    waitForConnections: true,
+    connectionLimit: 10,
+    enableKeepAlive: true,
+    keepAliveInitialDelay: 0,
   });
   dbReady = true;
 }
@@ -119,11 +119,11 @@ async function handleRoms(search: URLSearchParams) {
   }
 
   const offset = page * pageSize;
-  const [rows]      = await pool!.execute(
+  const [rows] = await pool!.execute(
     `SELECT * FROM roms WHERE ${where} ORDER BY download_count DESC LIMIT ? OFFSET ?`,
     [...params, pageSize, offset]
   );
-  const [cnt]       = await pool!.execute(
+  const [cnt] = await pool!.execute(
     `SELECT COUNT(*) AS total FROM roms WHERE ${where}`, params
   ) as [Record<string,unknown>[], unknown];
   return json({ data: rows, total: Number(cnt[0].total) });
@@ -146,10 +146,19 @@ const FETCH_HEADERS = {
 
 function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
 
-async function fetchHTML(url: string) {
-  const res = await fetch(url, { headers: FETCH_HEADERS });
-  if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
-  return res.text();
+async function fetchWithRetry(url: string, attempts = 3): Promise<string> {
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const res = await fetch(url, { headers: FETCH_HEADERS });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.text();
+    } catch (err) {
+      lastErr = err;
+      if (i < attempts - 1) await sleep(800 * (i + 1));
+    }
+  }
+  throw lastErr;
 }
 
 type ConsoleRow = { name: string; slug: string; image_url: string | null; rom_count: number; total_downloads: number };
@@ -209,22 +218,26 @@ function getMaxPage(html: string): number {
 
 async function fetchDirectUrl(pageUrl: string): Promise<string | null> {
   try {
-    const html = await fetchHTML(pageUrl + "/download?speed=fast");
+    const html = await fetchWithRetry(pageUrl + "/download?speed=fast", 2);
     const m = html.match(/href="(https:\/\/downloads\.romspedia\.com\/roms\/[^"]+)"/);
     return m?.[1] ?? null;
   } catch { return null; }
 }
 
+// 15 concurrent workers, 30 ms cooldown per worker — ~5x faster than before
 async function resolveUrls(roms: RomRow[], onProgress?: (d: number, t: number) => Promise<void>) {
-  const queue = [...roms]; let done = 0; const total = roms.length;
-  const workers = Array.from({ length: 6 }, async () => {
+  const queue = [...roms];
+  let done = 0;
+  const total = roms.length;
+  const workers = Array.from({ length: 15 }, async () => {
     while (queue.length) {
-      const rom = queue.shift(); if (!rom) break;
+      const rom = queue.shift();
+      if (!rom) break;
       const url = await fetchDirectUrl(rom.page_url);
       if (url) rom.download_url = url;
       done++;
-      if (onProgress && (done % 10 === 0 || done === total)) await onProgress(done, total);
-      await sleep(80);
+      if (onProgress && (done % 20 === 0 || done === total)) await onProgress(done, total);
+      await sleep(30);
     }
   });
   await Promise.all(workers);
@@ -254,7 +267,7 @@ async function upsertConsole(c: ConsoleRow): Promise<string> {
 
 async function upsertRoms(roms: RomRow[]) {
   if (!roms.length) return;
-  const BATCH = 100;
+  const BATCH = 200;
   for (let i = 0; i < roms.length; i += BATCH) {
     const vals = roms.slice(i, i + BATCH).map(r => [
       crypto.randomUUID(), r.console_id ?? null, r.console_slug, r.title, r.slug,
@@ -277,12 +290,15 @@ async function updateJob(jobId: string, fields: Record<string, unknown>) {
   await pool!.query(`UPDATE scrape_jobs SET ${sets} WHERE id=?`, [...Object.values(fields), jobId]);
 }
 
-async function scrapeConsole(
-  c: ConsoleRow, limit: number, jobId: string,
-) {
-  const firstUrl  = `${BASE_URL}/roms/${c.slug}`;
+async function scrapeConsole(c: ConsoleRow, limit: number, jobId: string): Promise<number> {
+  const firstUrl = `${BASE_URL}/roms/${c.slug}`;
   let firstHtml: string;
-  try { firstHtml = await fetchHTML(firstUrl); } catch (e) { console.warn(`Skip ${c.slug}:`, e); return; }
+  try {
+    firstHtml = await fetchWithRetry(firstUrl);
+  } catch (e) {
+    console.warn(`Skip ${c.slug}:`, e);
+    return 0;
+  }
 
   const maxPage = getMaxPage(firstHtml);
   const all     = parseRomPage(firstHtml, c.slug);
@@ -290,11 +306,14 @@ async function scrapeConsole(
 
   for (let p = 2; p <= maxPage; p++) {
     if (limit && all.length >= limit) break;
-    await sleep(500);
+    await sleep(250);
     try {
-      all.push(...parseRomPage(await fetchHTML(`${firstUrl}/page/${p}`), c.slug));
-      await updateJob(jobId, { pages_done: p, pages_total: maxPage });
-    } catch { break; }
+      all.push(...parseRomPage(await fetchWithRetry(`${firstUrl}/page/${p}`), c.slug));
+      await updateJob(jobId, { pages_done: p });
+    } catch (e) {
+      // Skip failed pages — don't abort the console
+      console.warn(`Page ${p} of ${c.slug} failed:`, e);
+    }
   }
 
   const seen = new Set<string>();
@@ -328,7 +347,7 @@ async function handleScrapeStart(body: { console?: string; consoles?: string[]; 
 
   EdgeRuntime.waitUntil((async () => {
     try {
-      const html        = await fetchHTML(`${BASE_URL}/roms`);
+      const html        = await fetchWithRetry(`${BASE_URL}/roms`);
       const allConsoles = parseConsoles(html);
 
       let targets = allConsoles;
@@ -350,15 +369,37 @@ async function handleScrapeStart(body: { console?: string; consoles?: string[]; 
       }
 
       let totalRoms = 0;
-      for (const c of targets) {
-        await updateJob(jobId, { current_console: c.name, pages_done: 0, pages_total: 0, urls_done: 0, urls_total: 0 });
-        const count = await scrapeConsole(c, body.limit ?? 0, jobId);
-        totalRoms += count ?? 0;
-        await updateJob(jobId, { roms_scraped: totalRoms });
-        await sleep(700);
-      }
+      const errors: string[] = [];
 
-      await updateJob(jobId, { status: "completed", completed_at: new Date(), roms_scraped: totalRoms, current_console: null });
+      // Process 2 consoles concurrently
+      const queue = [...targets];
+      const workers = Array.from({ length: 2 }, async () => {
+        while (queue.length) {
+          const c = queue.shift();
+          if (!c) break;
+          await updateJob(jobId, { current_console: c.name, pages_done: 0, pages_total: 0, urls_done: 0, urls_total: 0 });
+          try {
+            const count = await scrapeConsole(c, body.limit ?? 0, jobId);
+            totalRoms += count;
+            await updateJob(jobId, { roms_scraped: totalRoms });
+          } catch (err) {
+            // Log failure but keep going with remaining consoles
+            const msg = `${c.name}: ${String(err)}`;
+            errors.push(msg);
+            console.error("Console failed:", msg);
+          }
+          await sleep(300);
+        }
+      });
+      await Promise.all(workers);
+
+      await updateJob(jobId, {
+        status: errors.length && totalRoms === 0 ? "failed" : "completed",
+        completed_at: new Date(),
+        roms_scraped: totalRoms,
+        current_console: null,
+        ...(errors.length ? { error_msg: errors.slice(0, 3).join("; ") } : {}),
+      });
     } catch (err) {
       await updateJob(jobId, { status: "failed", completed_at: new Date(), error_msg: String(err) });
     }
@@ -383,10 +424,10 @@ Deno.serve(async (req: Request) => {
 
   try {
     if (req.method === "GET") {
-      if (path === "/consoles")    return handleConsoles();
-      if (path === "/roms/total")  return handleRomsTotal();
+      if (path === "/consoles")     return handleConsoles();
+      if (path === "/roms/total")   return handleRomsTotal();
       if (path.startsWith("/roms")) return handleRoms(url.searchParams);
-      if (path === "/jobs/latest") return handleLatestJob();
+      if (path === "/jobs/latest")  return handleLatestJob();
     }
     if (req.method === "POST" && path === "/scrape") {
       const body = await req.json().catch(() => ({}));
