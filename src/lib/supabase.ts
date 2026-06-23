@@ -1,3 +1,7 @@
+const SUPABASE_URL  = import.meta.env.VITE_SUPABASE_URL as string;
+const SUPABASE_KEY  = import.meta.env.VITE_SUPABASE_ANON_KEY as string;
+const API_BASE      = `${SUPABASE_URL}/functions/v1/mysql-api`;
+
 export type Console = {
   id: string;
   name: string;
@@ -42,16 +46,20 @@ export type ScrapeJob = {
 };
 
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, init);
-  if (!res.ok) {
-    const text = await res.text().catch(() => res.statusText);
-    throw new Error(text);
-  }
+  const res = await fetch(`${API_BASE}${path}`, {
+    ...init,
+    headers: {
+      'Authorization': `Bearer ${SUPABASE_KEY}`,
+      'Content-Type': 'application/json',
+      ...(init?.headers ?? {}),
+    },
+  });
+  if (!res.ok) throw new Error(await res.text().catch(() => res.statusText));
   return res.json() as Promise<T>;
 }
 
 export async function getConsoles(): Promise<ConsoleWithStats[]> {
-  return apiFetch('/api/consoles');
+  return apiFetch('/consoles');
 }
 
 export async function getRoms(params: {
@@ -61,20 +69,20 @@ export async function getRoms(params: {
   pageSize?: number;
 }): Promise<{ data: Rom[]; total: number }> {
   const q = new URLSearchParams();
-  if (params.console)              q.set('console',  params.console);
-  if (params.search?.trim())       q.set('search',   params.search.trim());
-  if (params.page  !== undefined)  q.set('page',     String(params.page));
+  if (params.console)               q.set('console',  params.console);
+  if (params.search?.trim())        q.set('search',   params.search.trim());
+  if (params.page  !== undefined)   q.set('page',     String(params.page));
   if (params.pageSize !== undefined) q.set('pageSize', String(params.pageSize));
-  return apiFetch(`/api/roms?${q}`);
+  return apiFetch(`/roms?${q}`);
 }
 
 export async function getTotalRoms(): Promise<number> {
-  const { total } = await apiFetch<{ total: number }>('/api/roms/total');
+  const { total } = await apiFetch<{ total: number }>('/roms/total');
   return total;
 }
 
 export async function getLatestJob(): Promise<ScrapeJob | null> {
-  return apiFetch('/api/jobs/latest');
+  return apiFetch('/jobs/latest');
 }
 
 export async function startScrapeJob(options?: {
@@ -83,9 +91,8 @@ export async function startScrapeJob(options?: {
   consolesOnly?: boolean;
   limit?: number;
 }): Promise<void> {
-  await apiFetch('/api/scrape/start', {
+  await apiFetch('/scrape', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(options ?? {}),
   });
 }
@@ -97,6 +104,6 @@ export async function getAllMatchingRoms(params: {
   const q = new URLSearchParams({ all: '1' });
   if (params.console)        q.set('console', params.console);
   if (params.search?.trim()) q.set('search',  params.search.trim());
-  const { data } = await apiFetch<{ data: Array<{ id: string; title: string; download_url: string | null }> }>(`/api/roms?${q}`);
+  const { data } = await apiFetch<{ data: Array<{ id: string; title: string; download_url: string | null }> }>(`/roms?${q}`);
   return data;
 }
