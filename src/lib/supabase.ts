@@ -1,6 +1,5 @@
-const SUPABASE_URL  = import.meta.env.VITE_SUPABASE_URL as string;
-const SUPABASE_KEY  = import.meta.env.VITE_SUPABASE_ANON_KEY as string;
-const API_BASE      = `${SUPABASE_URL}/functions/v1/mysql-api`;
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL as string;
+const API_BASE     = `${SUPABASE_URL}/functions/v1/mysql-api`;
 
 export type Console = {
   id: string;
@@ -49,7 +48,6 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
     ...init,
     headers: {
-      'Authorization': `Bearer ${SUPABASE_KEY}`,
       'Content-Type': 'application/json',
       ...(init?.headers ?? {}),
     },
