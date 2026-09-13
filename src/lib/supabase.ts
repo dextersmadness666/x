@@ -1,5 +1,4 @@
-const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL as string;
-const API_BASE     = `${SUPABASE_URL}/functions/v1/mysql-api`;
+const API_BASE = '/api';
 
 export type Console = {
   id: string;
