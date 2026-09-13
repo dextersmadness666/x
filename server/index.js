@@ -293,9 +293,16 @@ app.use(express.static(distDir));
 app.get('/api/*', (_req, res) => res.status(404).json({ error: 'Not found' }));
 app.get('*', (_req, res) => res.sendFile(path.join(distDir, 'index.html')));
 
-// ── Start ─────────────────────────────────────────────────────────────────────
+// ── Exports for Vite dev server integration ──────────────────────────────────
 
-const PORT = process.env.PORT || 3001;
-initDb()
-  .then(() => app.listen(PORT, () => console.log(`API server → http://localhost:${PORT}`)))
-  .catch(err => { console.error('DB init failed:', err.message); process.exit(1); });
+export { app, initDb };
+
+// ── Start (only when run directly, not imported) ─────────────────────────────
+
+const isMain = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
+if (isMain) {
+  const PORT = process.env.PORT || 3001;
+  initDb()
+    .then(() => app.listen(PORT, () => console.log(`API server → http://localhost:${PORT}`)))
+    .catch(err => { console.error('DB init failed:', err.message); process.exit(1); });
+}
