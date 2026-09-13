@@ -2,7 +2,7 @@ import { useEffect, useState, useCallback } from 'react';
 import {
   getConsoles, getRoms, getTotalRoms, getLatestJob, startScrapeJob, getAllMatchingRoms,
   type Console, type ConsoleWithStats, type Rom, type ScrapeJob,
-} from './lib/api';
+} from './lib/supabase';
 import ConsoleGrid from './components/ConsoleGrid';
 import RomTable from './components/RomTable';
 import JobStatus from './components/JobStatus';

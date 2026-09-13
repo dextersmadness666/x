@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { startScrapeJob, type ScrapeJob } from '../lib/api';
+import { startScrapeJob, type ScrapeJob } from '../lib/supabase';
 
 type Props = {
   latestJob: ScrapeJob | null;

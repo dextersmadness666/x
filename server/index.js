@@ -3,7 +3,6 @@ import express from 'express';
 import mysql from 'mysql2/promise';
 import cors from 'cors';
 import { spawn } from 'child_process';
-import { randomUUID } from 'crypto';
 import { fileURLToPath } from 'url';
 import path from 'path';
 
@@ -76,14 +75,6 @@ async function initDb() {
       created_at       DATETIME    DEFAULT NOW()
     )
   `);
-
-  // Migrate: add queue support columns (idempotent)
-  for (const sql of [
-    'ALTER TABLE scrape_jobs ADD COLUMN target_label VARCHAR(255)',
-    'ALTER TABLE scrape_jobs ADD COLUMN job_params TEXT',
-  ]) {
-    try { await pool.execute(sql); } catch { /* column already exists */ }
-  }
 
   console.log(`Connected to MySQL: ${DB_BASE.host} → ${DB_NAME}`);
 }
@@ -169,8 +160,7 @@ app.get('/api/jobs/latest', async (req, res) => {
   }
 });
 
-// POST /api/scrape — create a job and immediately start scraping (legacy instant-start)
-app.post('/api/scrape', async (req, res) => {
+app.post('/api/scrape/start', async (req, res) => {
   try {
     const { console: consoleName, consoles, consolesOnly, limit } = req.body ?? {};
 
@@ -199,110 +189,14 @@ app.post('/api/scrape', async (req, res) => {
   }
 });
 
-// GET /api/jobs — list all jobs (queue page)
-app.get('/api/jobs', async (req, res) => {
-  try {
-    const [rows] = await pool.execute(
-      'SELECT * FROM scrape_jobs ORDER BY created_at DESC LIMIT 100'
-    );
-    res.json(rows);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// POST /api/jobs — create a queued job (does not start it)
-app.post('/api/jobs', async (req, res) => {
-  try {
-    const { label, params } = req.body ?? {};
-    const id = randomUUID();
-    const jobLabel  = label ?? 'Scrape job';
-    const jobParams = JSON.stringify(params ?? {});
-    await pool.query(
-      "INSERT INTO scrape_jobs (id, status, target_label, job_params, created_at, started_at) VALUES (?, 'queued', ?, ?, NOW(), NULL)",
-      [id, jobLabel, jobParams]
-    );
-    const [rows] = await pool.execute('SELECT * FROM scrape_jobs WHERE id = ?', [id]);
-    res.status(201).json(rows[0]);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// POST /api/jobs/:id/start — start a queued job
-app.post('/api/jobs/:id/start', async (req, res) => {
-  try {
-    const [rows] = await pool.execute(
-      'SELECT status, job_params FROM scrape_jobs WHERE id = ?', [req.params.id]
-    );
-    if (!rows.length) return res.status(404).json({ error: 'Job not found' });
-    if (rows[0].status !== 'queued') return res.status(400).json({ error: 'Job is not in queued state' });
-
-    const params = JSON.parse(rows[0].job_params || '{}');
-    const { console: consoleName, consoles, consolesOnly, limit } = params;
-
-    const args = [];
-    if (consolesOnly)     args.push('--consoles-only');
-    if (consoleName)      args.push(`--console=${consoleName}`);
-    if (consoles?.length) args.push(`--consoles=${consoles.join(',')}`);
-    if (limit)            args.push(`--limit=${limit}`);
-
-    await pool.execute(
-      "UPDATE scrape_jobs SET status='running', started_at=NOW() WHERE id = ?", [req.params.id]
-    );
-
-    spawn('node', ['scraper/index.js', ...args], {
-      cwd: path.join(__dirname, '..'),
-      detached: true,
-      stdio: 'ignore',
-      env: { ...process.env },
-    }).unref();
-
-    res.json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// POST /api/jobs/:id/cancel — cancel a running or queued job
-app.post('/api/jobs/:id/cancel', async (req, res) => {
-  try {
-    await pool.execute(
-      "UPDATE scrape_jobs SET status = 'cancelled' WHERE id = ? AND status IN ('running', 'queued')",
-      [req.params.id]
-    );
-    res.json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// DELETE /api/jobs/:id — delete a job
-app.delete('/api/jobs/:id', async (req, res) => {
-  try {
-    await pool.execute('DELETE FROM scrape_jobs WHERE id = ?', [req.params.id]);
-    res.json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
 // Serve built frontend in production
 const distDir = path.join(__dirname, '..', 'dist');
 app.use(express.static(distDir));
-app.get('/api/*', (_req, res) => res.status(404).json({ error: 'Not found' }));
 app.get('*', (_req, res) => res.sendFile(path.join(distDir, 'index.html')));
 
-// ── Exports for Vite dev server integration ──────────────────────────────────
+// ── Start ─────────────────────────────────────────────────────────────────────
 
-export { app, initDb };
-
-// ── Start (only when run directly, not imported) ─────────────────────────────
-
-const isMain = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
-if (isMain) {
-  const PORT = process.env.PORT || 3001;
-  initDb()
-    .then(() => app.listen(PORT, () => console.log(`API server → http://localhost:${PORT}`)))
-    .catch(err => { console.error('DB init failed:', err.message); process.exit(1); });
-}
+const PORT = process.env.PORT || 3001;
+initDb()
+  .then(() => app.listen(PORT, () => console.log(`API server → http://localhost:${PORT}`)))
+  .catch(err => { console.error('DB init failed:', err.message); process.exit(1); });
