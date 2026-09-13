@@ -1,5 +1,5 @@
 import { useState, useCallback } from 'react';
-import type { ConsoleWithStats, ScrapeJob } from '../lib/supabase';
+import type { ConsoleWithStats, ScrapeJob } from '../lib/api';
 
 type Props = {
   consoles: ConsoleWithStats[];

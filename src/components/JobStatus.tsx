@@ -1,4 +1,4 @@
-import type { ScrapeJob } from '../lib/supabase';
+import type { ScrapeJob } from '../lib/api';
 
 type Props = {
   job: ScrapeJob;

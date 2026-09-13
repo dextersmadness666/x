@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import {
   type ConsoleWithStats, type ScrapeJob,
   getJobs, createQueuedJob, startJob, cancelJob, deleteJob,
-} from '../lib/supabase';
+} from '../lib/api';
 
 type Props = { consoles: ConsoleWithStats[] };
 

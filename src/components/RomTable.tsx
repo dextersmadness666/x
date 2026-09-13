@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import type { Rom, Console } from '../lib/supabase';
+import type { Rom, Console } from '../lib/api';
 
 type SelectedRom = { title: string; download_url: string | null };
 
